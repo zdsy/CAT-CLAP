@@ -1,0 +1,28 @@
+{
+  "seed0": {
+    "legacy": true,
+    "nested": false,
+    "note": "Archived original Figure 2 manifests; shots were sampled independently.",
+    "sampling_seed": 1337
+  },
+  "seed1": {
+    "legacy": false,
+    "nested": true,
+    "sampling_seed": 2027
+  },
+  "seed2": {
+    "legacy": false,
+    "nested": true,
+    "sampling_seed": 3407
+  },
+  "seed3": {
+    "legacy": false,
+    "nested": true,
+    "sampling_seed": 4519
+  },
+  "seed4": {
+    "legacy": false,
+    "nested": true,
+    "sampling_seed": 5651
+  }
+}

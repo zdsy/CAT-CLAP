@@ -1,0 +1,43 @@
+base:
+  n_way: 5
+  k_shot: 1
+  q_queries: 1
+  distance: l2
+  task_type: VoxCeleb_51
+  cuda: 0
+  num_repeats: 1
+  out_dim: 128
+models:
+- Hybrid
+hyper:
+  initial_lr: 0.0005
+  min_lr: 0.0001
+  patience: 100000
+  factor: 0.1
+  scheduler_warm_up: 20
+training:
+  eval_zero_shot_dataset: false
+  eval_zero_shot_split: test
+  epochs: 500
+  episodes_per_epoch: 10
+  train_batch_size: 20
+  val_tasks: 1000
+  test_tasks: 10000
+  break_threshold: 1000
+  eval_spacing: 100
+  trans_batch: false
+  num_workers: 0
+data:
+  variable: true
+  name: VoxCeleb_5s
+  norm: global
+  type: variable_spec
+  fixed: true
+  fixed_path: dataset_/splits/VoxCeleb_norm_split.npy
+  supervised_split_path: dataset_/splits/VoxCeleb1_supervised_sample_split.csv
+  data_path: ../../Datasets/VoxCeleb1_features
+  wav_path: ../../Datasets/VoxCeleb1_Mirror
+split:
+  train: 0.7
+  val: 0.1
+  test: 0.2
