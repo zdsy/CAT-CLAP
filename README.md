@@ -61,13 +61,3 @@ sampling seeds are recorded in each dataset's `metadata.json`. The `--seed`
 argument controls the method RNG, not support-set selection. The frozen-CLAP
 classifier reference is implemented separately in each dataset's
 `finetune_clap_supervised.py`.
-
-## Tests
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-These synthetic smoke tests exercise both CAT-CLAP adapters without dataset
-downloads. Reproducing paper accuracies requires the corresponding audio,
-features, and checkpoint.
