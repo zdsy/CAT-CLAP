@@ -132,15 +132,6 @@ def make_pairwise_logits(query_pair, proto_pair, distance="l2", beta=5.0):
     return beta * (query_pair * proto_pair).sum(dim=-1)
 
 
-def alignment_loss(audio_proto, text_proto, temperature=1.0):
-    audio_proto = F.normalize(audio_proto, p=2, dim=-1)
-    text_proto = F.normalize(text_proto, p=2, dim=-1)
-    labels = torch.arange(audio_proto.size(0), device=audio_proto.device)
-    logits_a2t = audio_proto @ text_proto.T / temperature
-    logits_t2a = text_proto @ audio_proto.T / temperature
-    return F.cross_entropy(logits_a2t, labels) + F.cross_entropy(logits_t2a, labels)
-
-
 def build_support_tensors(clap_model, support_loader, device):
     feats = []
     labels = []
@@ -173,7 +164,7 @@ def build_support_frame_tensors(clap_model, support_loader, num_classes, k_shot,
     return sample_frames, class_frame_proto, class_frame_sum
 
 
-def adapt_protoclap(
+def adapt_catclap(
     support_feats,
     support_labels,
     text_init,
@@ -184,33 +175,25 @@ def adapt_protoclap(
     lr=1e-3,
     adapter_reduction=4,
     adapter_residual_ratio=0.2,
-    adapter_arch="tclap",
-    use_leave_one_out=False,
+    adapter_arch="mlp",
     train_text_memory=True,
-    lambda_cls=1.0,
-    lambda_align=0.5,
-    align_temperature=1.0,
     alpha=0.5,
     beta=5.0,
     distance="l2",
     weight_decay=0.05,
     use_adapter=True,
-    learn_audio_memory=True,
-    symmetric_audio_memory=True,
-    alignment_source="audio_memory",
-    tcam_alignment_proto=None,
     eps=1e-8,
 ):
+    """Adapt the CAT-CLAP adapter and text memory on an all-way support set."""
+    if adapter_arch not in {"mlp", "ln"}:
+        raise ValueError(f"Unknown CAT-CLAP adapter: {adapter_arch}")
+
     device = support_feats.device
     d = support_feats.shape[-1]
     hidden_dim = max(d // adapter_reduction, 1)
-
-    if learn_audio_memory:
-        audio_memory = torch.nn.Parameter(support_feats.clone())
-    else:
-        audio_memory = support_feats.detach()
     text_memory = torch.nn.Parameter(text_init.clone())
-    if adapter_arch == "protoclip":
+
+    if adapter_arch == "ln":
         adapter_down = torch.nn.Linear(d, hidden_dim, bias=False, device=device)
         adapter_norm_down = torch.nn.LayerNorm(hidden_dim, device=device)
         adapter_up = torch.nn.Linear(hidden_dim, d, bias=False, device=device)
@@ -231,7 +214,7 @@ def adapt_protoclap(
     def adapter(x):
         if not use_adapter or not use_finetune:
             return F.normalize(x, p=2, dim=-1)
-        if adapter_arch == "protoclip":
+        if adapter_arch == "ln":
             z = adapter_norm_down(adapter_down(x))
             z = adapter_norm_up(adapter_up(z))
         else:
@@ -240,115 +223,53 @@ def adapt_protoclap(
         out = adapter_residual_ratio * z + (1.0 - adapter_residual_ratio) * x
         return F.normalize(out, p=2, dim=-1)
 
-    def audio_proto_from_memory():
-        if learn_audio_memory:
-            proto_source = (
-                adapter(audio_memory)
-                if symmetric_audio_memory
-                else F.normalize(audio_memory, p=2, dim=-1)
-            )
-        else:
-            proto_source = (
-                adapter(support_feats)
-                if symmetric_audio_memory
-                else F.normalize(support_feats, p=2, dim=-1)
-            )
-        audio_proto = proto_source.view(num_classes, k_shot, d).mean(dim=1)
-        return F.normalize(audio_proto, p=2, dim=-1)
+    def support_prototypes():
+        features = adapter(support_feats)
+        prototypes = features.view(num_classes, k_shot, d).mean(dim=1)
+        return F.normalize(prototypes, p=2, dim=-1)
 
-    def alignment_audio_proto(audio_proto):
-        if alignment_source == "audio_memory":
-            return audio_proto
-        if alignment_source == "global":
-            global_proto = adapter(support_feats).view(num_classes, k_shot, d).mean(dim=1)
-            return F.normalize(global_proto, p=2, dim=-1)
-        if alignment_source == "tcam":
-            if tcam_alignment_proto is None:
-                raise ValueError("TCAM alignment requires precomputed TCAM prototypes")
-            return adapter(tcam_alignment_proto)
-        raise ValueError(f"Unknown alignment source: {alignment_source}")
+    params = []
+    if use_adapter:
+        params.extend(adapter_params)
+    if train_text_memory:
+        params.append(text_memory)
 
-    support_index_grid = torch.arange(
-        num_classes * k_shot, device=device
-    ).view(num_classes, k_shot)
-
-    if use_finetune:
-        params = []
-        if learn_audio_memory:
-            params.append(audio_memory)
-        if use_adapter:
-            params.extend(adapter_params)
-        if train_text_memory:
-            params.append(text_memory)
-        optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay, eps=1e-4)
-
-        for ft_step in tqdm(range(ft_steps), desc="T-CLAP all-way adaptation"):
+    if use_finetune and params:
+        optimizer = torch.optim.AdamW(
+            params, lr=lr, weight_decay=weight_decay, eps=1e-4
+        )
+        for _ in tqdm(range(ft_steps), desc="CAT-CLAP all-way adaptation"):
             optimizer.zero_grad()
+            support_query = adapter(support_feats)
+            audio_proto = support_prototypes()
             text_proto = F.normalize(text_memory, p=2, dim=-1)
-
-            if use_leave_one_out and k_shot > 1:
-                heldout_position = ft_step % k_shot
-                class_ids = torch.arange(num_classes, device=device)
-                pseudo_query_idx = support_index_grid[:, heldout_position]
-                pseudo_support_mask = torch.ones(
-                    num_classes, k_shot, dtype=torch.bool, device=device
-                )
-                pseudo_support_mask[:, heldout_position] = False
-                pseudo_support_idx = support_index_grid[pseudo_support_mask].view(
-                    num_classes, k_shot - 1
-                ).reshape(-1)
-
-                support_query = adapter(support_feats[pseudo_query_idx])
-                memory_source = (
-                    audio_memory[pseudo_support_idx]
-                    if learn_audio_memory
-                    else support_feats[pseudo_support_idx]
-                )
-                proto_source = (
-                    adapter(memory_source)
-                    if symmetric_audio_memory
-                    else F.normalize(memory_source, p=2, dim=-1)
-                )
-                audio_proto = proto_source.view(
-                    num_classes, k_shot - 1, d
-                ).mean(dim=1)
-                audio_proto = F.normalize(audio_proto, p=2, dim=-1)
-                cls_labels = class_ids
-            else:
-                support_query = adapter(support_feats)
-                audio_proto = audio_proto_from_memory()
-                cls_labels = support_labels
-
-            audio_logits = make_logits(support_query, audio_proto, distance=distance, beta=beta)
-            text_logits = make_logits(support_query, text_proto, distance=distance, beta=beta)
-            probs = alpha * F.softmax(audio_logits, dim=1) + (1.0 - alpha) * F.softmax(text_logits, dim=1)
-            cls_loss = F.nll_loss(torch.log(probs.clamp_min(eps)), cls_labels)
-            loss = lambda_cls * cls_loss
-            if lambda_align > 0.0:
-                align_audio = alignment_audio_proto(audio_proto)
-                loss = loss + lambda_align * alignment_loss(
-                    align_audio, text_proto, align_temperature
-                )
+            audio_logits = make_logits(
+                support_query, audio_proto, distance=distance, beta=beta
+            )
+            text_logits = make_logits(
+                support_query, text_proto, distance=distance, beta=beta
+            )
+            probs = (
+                alpha * F.softmax(audio_logits, dim=1)
+                + (1.0 - alpha) * F.softmax(text_logits, dim=1)
+            )
+            loss = F.nll_loss(torch.log(probs.clamp_min(eps)), support_labels)
             loss.backward()
             optimizer.step()
 
     with torch.no_grad():
-        audio_proto = audio_proto_from_memory()
+        audio_proto = support_prototypes()
         text_proto = F.normalize(text_memory, p=2, dim=-1)
 
     return adapter, audio_proto.detach(), text_proto.detach()
 
 
-def can_audio_logits_from_frames(
+def tcam_audio_logits_from_frames(
     query_frames,
     support_frame_proto,
     adapter,
     class_chunk_size=128,
-    can_temperature=0.025,
-    tcam_score_mode="mean",
-    tcam_top_m=8,
-    tcam_attn_mode="residual",
-    tcam_mix=0.5,
+    tcam_temperature=0.025,
     beta=5.0,
     distance="l2",
     eps=1e-8,
@@ -362,43 +283,14 @@ def can_audio_logits_from_frames(
     for start in range(0, num_classes, class_chunk_size):
         support_chunk = support_frame_proto[start:start + class_chunk_size]
         sim = torch.einsum("ntd,qsd->nqts", support_chunk, query_frames)
-        if tcam_score_mode == "mean":
-            support_scores = sim.mean(dim=-1)
-            query_scores = sim.mean(dim=-2)
-        elif tcam_score_mode == "topm":
-            support_m = min(max(int(tcam_top_m), 1), sim.size(-1))
-            query_m = min(max(int(tcam_top_m), 1), sim.size(-2))
-            support_scores = sim.topk(support_m, dim=-1).values.mean(dim=-1)
-            query_scores = sim.topk(query_m, dim=-2).values.mean(dim=-2)
-        else:
-            raise ValueError(f"Unknown TCAM score mode: {tcam_score_mode}")
-
-        if tcam_attn_mode == "residual":
-            support_attn = F.softmax(support_scores / can_temperature, dim=-1) + 1.0
-            query_attn = F.softmax(query_scores / can_temperature, dim=-1) + 1.0
-        elif tcam_attn_mode == "sigmoid_residual":
-            support_threshold = support_scores.mean(dim=-1, keepdim=True)
-            query_threshold = query_scores.mean(dim=-1, keepdim=True)
-            support_attn = 1.0 + torch.sigmoid(
-                (support_scores - support_threshold) / can_temperature
-            )
-            query_attn = 1.0 + torch.sigmoid(
-                (query_scores - query_threshold) / can_temperature
-            )
-        elif tcam_attn_mode == "softmax_mix":
-            support_soft = F.softmax(support_scores / can_temperature, dim=-1)
-            query_soft = F.softmax(query_scores / can_temperature, dim=-1)
-            support_uniform = torch.full_like(support_soft, 1.0 / support_soft.size(-1))
-            query_uniform = torch.full_like(query_soft, 1.0 / query_soft.size(-1))
-            support_attn = (1.0 - tcam_mix) * support_uniform + tcam_mix * support_soft
-            query_attn = (1.0 - tcam_mix) * query_uniform + tcam_mix * query_soft
-        elif tcam_attn_mode == "sigmoid":
-            support_threshold = support_scores.mean(dim=-1, keepdim=True)
-            query_threshold = query_scores.mean(dim=-1, keepdim=True)
-            support_attn = torch.sigmoid((support_scores - support_threshold) / can_temperature)
-            query_attn = torch.sigmoid((query_scores - query_threshold) / can_temperature)
-        else:
-            raise ValueError(f"Unknown TCAM attention mode: {tcam_attn_mode}")
+        support_scores = sim.mean(dim=-1)
+        query_scores = sim.mean(dim=-2)
+        support_attn = F.softmax(
+            support_scores / tcam_temperature, dim=-1
+        ) + 1.0
+        query_attn = F.softmax(
+            query_scores / tcam_temperature, dim=-1
+        ) + 1.0
 
         proto_pair = torch.einsum("ntd,nqt->qnd", support_chunk, support_attn)
         proto_pair = proto_pair / support_attn.sum(dim=-1).transpose(0, 1).unsqueeze(-1).clamp(min=eps)
@@ -413,33 +305,25 @@ def can_audio_logits_from_frames(
     return torch.cat(logits_out, dim=1)
 
 
-def can_audio_logits_for_batch(
+def tcam_audio_logits_for_batch(
     clap_model,
     query_wavs,
     support_frame_proto,
     adapter,
     device,
     class_chunk_size=128,
-    can_temperature=0.025,
-    tcam_score_mode="mean",
-    tcam_top_m=8,
-    tcam_attn_mode="residual",
-    tcam_mix=0.5,
+    tcam_temperature=0.025,
     beta=5.0,
     distance="l2",
     eps=1e-8,
 ):
     query_frames = get_frame_embeddings(clap_model, query_wavs, device)
-    return can_audio_logits_from_frames(
+    return tcam_audio_logits_from_frames(
         query_frames=query_frames,
         support_frame_proto=support_frame_proto,
         adapter=adapter,
         class_chunk_size=class_chunk_size,
-        can_temperature=can_temperature,
-        tcam_score_mode=tcam_score_mode,
-        tcam_top_m=tcam_top_m,
-        tcam_attn_mode=tcam_attn_mode,
-        tcam_mix=tcam_mix,
+        tcam_temperature=tcam_temperature,
         beta=beta,
         distance=distance,
         eps=eps,

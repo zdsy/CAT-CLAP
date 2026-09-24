@@ -12,8 +12,8 @@ ROOT = Path(__file__).resolve().parents[1] / "Examples"
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "CLAP_BirdClef"))
 
-from allway_core import adapt_protoclap, can_audio_logits_from_frames
-from proto_steps import eval_step_tmclap_no_audio
+from allway_core import adapt_catclap, tcam_audio_logits_from_frames
+from proto_steps import eval_step_catclap
 
 
 class DummyCLAP:
@@ -41,14 +41,14 @@ class MethodSmokeTest(unittest.TestCase):
             torch.tensor([0.9, 0.2, 0.0, 0.0]),
             torch.tensor([0.1, 0.9, 0.0, 0.0]),
         ]]
-        for arch in ("tclap", "protoclip"):
+        for arch in ("mlp", "ln"):
             with self.subTest(arch=arch):
-                result = eval_step_tmclap_no_audio(
+                result = eval_step_catclap(
                     clap_model=DummyCLAP(), batch_wavs=wavs, q_num=[1, 1],
                     y=torch.tensor([[0, 1, 0, 1]]),
                     batch_class_names=[["class_a", "class_b"]],
                     device=torch.device("cpu"), n_way=2, k_shot=1, q_queries=1,
-                    distance="l2", ft_steps=2, lambda_align=0.0,
+                    distance="l2", ft_steps=2,
                     adapter_arch=arch,
                 )
                 self.assertEqual(len(result[3]), 1)
@@ -58,16 +58,15 @@ class MethodSmokeTest(unittest.TestCase):
         support = F.normalize(torch.rand(4, 4), dim=-1)
         text = F.normalize(torch.rand(2, 4), dim=-1)
         labels = torch.tensor([0, 0, 1, 1])
-        for arch in ("tclap", "protoclip"):
+        for arch in ("mlp", "ln"):
             with self.subTest(arch=arch):
-                adapter, _, learned_text = adapt_protoclap(
+                adapter, _, learned_text = adapt_catclap(
                     support_feats=support, support_labels=labels,
                     text_init=text, num_classes=2, k_shot=2,
-                    ft_steps=2, adapter_arch=arch, lambda_align=0.0,
-                    learn_audio_memory=False,
+                    ft_steps=2, adapter_arch=arch,
                 )
                 frames = F.normalize(torch.rand(2, 3, 4), dim=-1)
-                logits = can_audio_logits_from_frames(
+                logits = tcam_audio_logits_from_frames(
                     query_frames=frames, support_frame_proto=frames,
                     adapter=adapter, class_chunk_size=1,
                 )

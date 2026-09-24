@@ -45,7 +45,7 @@ def main():
     from models.clap import ZeroShotCLAP
     from proto_steps import (
         eval_step_clap_audio_proto,
-        eval_step_tmclap_no_audio,
+        eval_step_catclap,
         eval_step_zero_shot_var,
     )
     from task_sampling_classes import NShotTaskSampler
@@ -144,9 +144,9 @@ def main():
             **kw, alpha=alpha, beta=beta,
         )
     else:
-        arch = "tclap" if args.method == "catclap_mlp" else "protoclip"
-        step = lambda **kw: eval_step_tmclap_no_audio(
-            **kw, lambda_align=0.0, adapter_arch=arch,
+        arch = "mlp" if args.method == "catclap_mlp" else "ln"
+        step = lambda **kw: eval_step_catclap(
+            **kw, adapter_arch=arch,
         )
 
     episode_acc = []

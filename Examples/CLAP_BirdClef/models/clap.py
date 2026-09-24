@@ -4,72 +4,19 @@ import torch.nn.functional as F
 from msclap import CLAP
 
 
-class AudioResidualAdapter(nn.Module):
-    def __init__(self, dim, reduction=4, residual_ratio=0.2):
-        super().__init__()
-        hidden_dim = max(dim // reduction, 1)
-        self.down = nn.Linear(dim, hidden_dim)
-        self.up = nn.Linear(hidden_dim, dim)
-        self.residual_ratio = residual_ratio
-
-    def forward(self, x):
-        z = self.up(F.relu(self.down(x), inplace=False))
-        out = (1.0 - self.residual_ratio) * x + self.residual_ratio * z
-        return F.normalize(out, p=2, dim=-1)
-
-
 class ZeroShotCLAP(nn.Module):
-    def __init__(self, model_id=None, device="cuda", version="2023", sample_rate=44100, finetuned_ckpt=None, audio_adapter_ckpt=None, register_frame_hook=True):
+    def __init__(self, model_id=None, device="cuda", version="2023", sample_rate=44100, register_frame_hook=True):
         super().__init__()
         self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
         self.sample_rate = sample_rate
         self.frame_features_cache = []
-        self._attribute_embedding_cache = None
-        self.audio_adapter = None
 
         use_cuda = self.device.type == "cuda"
         self.model = CLAP(model_id, version=version, use_cuda=use_cuda)
         self.model.read_audio = self._bypass_read_audio
-        if finetuned_ckpt:
-            self._load_finetuned_ckpt(finetuned_ckpt)
-        if audio_adapter_ckpt:
-            self._load_audio_adapter_ckpt(audio_adapter_ckpt)
         self._set_eval()
         if register_frame_hook:
             self._register_frame_hook()
-
-
-    def _load_finetuned_ckpt(self, ckpt_path):
-        ckpt = torch.load(ckpt_path, map_location=self.device)
-        state_dict = ckpt.get("model", ckpt)
-        missing, unexpected = self.model.clap.load_state_dict(state_dict, strict=False)
-        if missing:
-            print(f"Warning: fine-tuned CLAP checkpoint missing {len(missing)} keys.")
-        if unexpected:
-            print(f"Warning: fine-tuned CLAP checkpoint had {len(unexpected)} unexpected keys.")
-        print(f"Loaded fine-tuned CLAP checkpoint: {ckpt_path}")
-
-    def _load_audio_adapter_ckpt(self, ckpt_path):
-        ckpt = torch.load(ckpt_path, map_location=self.device)
-        state_dict = ckpt.get("adapter", ckpt)
-        dim = ckpt.get("dim")
-        if dim is None:
-            dim = state_dict["up.weight"].shape[0]
-
-        self.audio_adapter = AudioResidualAdapter(
-            dim=dim,
-            reduction=ckpt.get("reduction", 4),
-            residual_ratio=ckpt.get("residual_ratio", 0.2),
-        ).to(self.device)
-        self.audio_adapter.load_state_dict(state_dict, strict=True)
-        self.audio_adapter.eval()
-        print(f"Loaded CLAP audio adapter checkpoint: {ckpt_path}")
-
-    def _apply_audio_adapter(self, audio_embeds):
-        audio_embeds = F.normalize(audio_embeds.to(self.device).float(), p=2, dim=-1)
-        if self.audio_adapter is None:
-            return audio_embeds
-        return self.audio_adapter(audio_embeds)
 
     def _set_eval(self):
         for attr in ("model", "clap", "audio_encoder", "caption_encoder"):
@@ -160,7 +107,7 @@ class ZeroShotCLAP(nn.Module):
         class_name = str(class_name).strip()
         if "_" in class_name:
             return class_name.split("_", 1)[1].strip()
-        return class_name.replace("_", " ").strip()
+        return class_name
 
     def _text_prompts_for_class(self, class_name):
         common_name = self._common_name_from_class_name(class_name)
@@ -171,133 +118,8 @@ class ZeroShotCLAP(nn.Module):
             f"the sound of a {common_name} bird",
         ]
 
-    def _universal_attribute_prompts(self):
-        """
-        Domain-agnostic acoustic attributes used for support-conditioned text anchors.
-
-        These prompts describe morphology, spectrum, texture, and temporal structure
-        rather than dataset classes such as speakers, birds, or sound events.
-        """
-        return [
-            "a short impulsive sound",
-            "a long sustained sound",
-            "a repeating sound",
-            "a rhythmic sound",
-            "an irregular sound",
-            "a sparse sound with silence between events",
-            "a dense continuous sound texture",
-            "a sound with a sharp attack",
-            "a sound with a gradual onset",
-            "a sound with abrupt changes",
-            "a sound with smooth changes",
-            "a tonal sound",
-            "a harmonic sound",
-            "a noisy sound",
-            "a rough textured sound",
-            "a smooth textured sound",
-            "a bright high frequency sound",
-            "a dark low frequency sound",
-            "a muffled sound",
-            "a clear sound",
-            "a metallic sound",
-            "a percussive sound",
-            "a resonant sound",
-            "a dry non reverberant sound",
-            "a reverberant sound",
-            "a foreground sound with background noise",
-            "a sound with strong background ambience",
-            "a sound with a stable pitch",
-            "a sound with changing pitch",
-            "a sound with a wide frequency range",
-            "a sound with a narrow frequency range",
-            "a low energy sound",
-            "a high energy sound",
-            "a sound with fluctuating energy",
-            "a steady even sound",
-            "a sound made of many small events",
-            "a sound dominated by one salient event",
-            "a natural acoustic sound",
-            "a mechanical acoustic sound",
-            "a human produced acoustic sound",
-        ]
-
     @torch.no_grad()
-    def get_universal_attribute_embeddings(self):
-        if self._attribute_embedding_cache is not None:
-            return self._attribute_embedding_cache.to(self.device)
-
-        prompts = self._universal_attribute_prompts()
-        embeds = self.model.get_text_embeddings(prompts)
-        if not torch.is_tensor(embeds):
-            embeds = torch.as_tensor(embeds)
-        embeds = F.normalize(embeds.to(self.device), p=2, dim=-1)
-        self._attribute_embedding_cache = embeds.detach().cpu()
-        return embeds
-
-    @torch.no_grad()
-    def get_attribute_enhanced_text_anchors(
-        self,
-        class_names,
-        support_audio_features=None,
-        audio_waveforms=None,
-        k_shot=None,
-        attr_weight=1.0,
-        attr_temperature=20.0,
-        top_k=None,
-    ):
-        """
-        Build support-conditioned text anchors from a universal acoustic attribute bank.
-
-        The base class anchor keeps the normal class-name prompts. A class-level
-        support audio prototype retrieves or softly mixes domain-agnostic acoustic
-        attribute prompts in CLAP space, then the retrieved attribute vector is
-        fused back into the text anchor.
-        """
-        base_text = self.get_text_anchors(class_names)
-
-        if support_audio_features is None:
-            if audio_waveforms is None:
-                return base_text
-            support_audio_features = self.get_audio_features(audio_waveforms)
-        elif not torch.is_tensor(support_audio_features):
-            support_audio_features = torch.as_tensor(support_audio_features)
-
-        support_audio_features = F.normalize(
-            support_audio_features.to(self.device).float(), p=2, dim=-1
-        )
-
-        num_classes = len(class_names)
-        if support_audio_features.size(0) == num_classes:
-            support_proto = support_audio_features
-        else:
-            if k_shot is None:
-                if support_audio_features.size(0) % num_classes != 0:
-                    raise ValueError(
-                        "Cannot infer k_shot from support_audio_features. "
-                        "Pass k_shot explicitly."
-                    )
-                k_shot = support_audio_features.size(0) // num_classes
-            support_proto = support_audio_features.view(num_classes, k_shot, -1).mean(dim=1)
-            support_proto = F.normalize(support_proto, p=2, dim=-1)
-
-        attr_bank = self.get_universal_attribute_embeddings()
-        scores = support_proto @ attr_bank.T
-
-        if top_k is not None and 0 < top_k < attr_bank.size(0):
-            top_vals, top_idx = torch.topk(scores, k=top_k, dim=-1)
-            weights = F.softmax(top_vals * attr_temperature, dim=-1)
-            attr_selected = attr_bank[top_idx]
-            attr_proto = torch.einsum("nk,nkd->nd", weights, attr_selected)
-        else:
-            weights = F.softmax(scores * attr_temperature, dim=-1)
-            attr_proto = weights @ attr_bank
-
-        attr_proto = F.normalize(attr_proto, p=2, dim=-1)
-        enhanced = F.normalize(base_text + attr_weight * attr_proto, p=2, dim=-1)
-        return enhanced
-
-    @torch.no_grad()
-    def get_text_anchors(self, class_names, audio_waveforms=None):
+    def get_text_anchors(self, class_names):
         text_anchors = []
 
         for class_name in class_names:
@@ -321,7 +143,7 @@ class ZeroShotCLAP(nn.Module):
         audio_embeds = self._get_audio_embeddings_from_tensors(audio_tensors)
         self.frame_features_cache = []
         audio_embeds = audio_embeds.to(self.device)
-        return self._apply_audio_adapter(audio_embeds)
+        return F.normalize(audio_embeds, p=2, dim=-1)
 
     @torch.no_grad()
     def get_audio_frame_features(self, audio_waveforms, batch_size=32):
@@ -357,7 +179,6 @@ class ZeroShotCLAP(nn.Module):
                     frames = torch.cat(self.frame_features_cache, dim=0)
 
             frames = self._project_frame_features(frames)
-            frames = self._apply_audio_adapter(frames.reshape(-1, frames.shape[-1])).reshape_as(frames)
             all_frames.append(frames)
 
         self.frame_features_cache = []

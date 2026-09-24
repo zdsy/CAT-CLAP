@@ -127,7 +127,7 @@ def eval_step_clap_audio_proto(
     return 0, 0, avg_post, all_post
 
 
-def eval_step_tmclap_no_audio(
+def eval_step_catclap(
     clap_model,
     batch_wavs,
     q_num,
@@ -146,30 +146,17 @@ def eval_step_tmclap_no_audio(
     lr=1e-3,
     adapter_reduction=4,
     adapter_residual_ratio=0.2,
-    adapter_arch="tclap",
+    adapter_arch="mlp",
     use_adapter=True,
     use_tcam=True,
     train_text_memory=True,
-    lambda_align=0.5,
-    align_temperature=1.0,
     weight_decay=0.05,
-    can_temperature=0.025,
-    tcam_score_mode="mean",
-    tcam_top_m=8,
-    tcam_attn_mode="residual",
+    tcam_temperature=0.025,
     tcam_weight=0.5,
     text_mem_weight=0.5,
-    use_rdft_finetune=False,
     eps=1e-8,
 ):
-    """
-    TMCLAP-no-audio-memory: clean TMCLAP variant with no learnable audio memory.
-
-    Learnable episode parameters are only the residual audio adapter and text
-    memory. Audio prototypes are always computed from frozen support CLAP
-    embeddings after the current adapter, while inference fuses TCAM and text
-    branches with probability fusion.
-    """
+    """Run CAT-CLAP episodic adaptation and multimodal inference."""
 
     if hasattr(clap_model, "eval"):
         clap_model.eval()
@@ -222,19 +209,6 @@ def eval_step_tmclap_no_audio(
             return -beta * dist
         return beta * (query_pair * proto_pair).sum(dim=-1)
 
-    def _proto_clap_logits(query_feats, audio_proto, text_proto):
-        audio_logits = _make_logits(query_feats, audio_proto)
-        text_logits = _make_logits(query_feats, text_proto)
-        return alpha * audio_logits + (1.0 - alpha) * text_logits
-
-    def _alignment_loss(audio_proto, text_proto):
-        audio_proto = F.normalize(audio_proto, p=2, dim=-1)
-        text_proto = F.normalize(text_proto, p=2, dim=-1)
-        logits_a2t = audio_proto @ text_proto.T / align_temperature
-        logits_t2a = text_proto @ audio_proto.T / align_temperature
-        labels = torch.arange(audio_proto.size(0), device=device)
-        return F.cross_entropy(logits_a2t, labels) + F.cross_entropy(logits_t2a, labels)
-
     def _can_pairwise_features(support_frames, query_frames):
         d = support_frames.shape[-1]
         support_frames = support_frames.view(n_way, k_shot, -1, d).mean(dim=1)
@@ -242,31 +216,14 @@ def eval_step_tmclap_no_audio(
         query_frames = F.normalize(query_frames, p=2, dim=-1)
 
         sim = torch.einsum("ntd,qsd->nqts", support_frames, query_frames)
-        if tcam_score_mode == "mean":
-            support_scores = sim.mean(dim=-1)
-            query_scores = sim.mean(dim=-2)
-        elif tcam_score_mode == "topm":
-            support_m = min(max(int(tcam_top_m), 1), sim.size(-1))
-            query_m = min(max(int(tcam_top_m), 1), sim.size(-2))
-            support_scores = sim.topk(support_m, dim=-1).values.mean(dim=-1)
-            query_scores = sim.topk(query_m, dim=-2).values.mean(dim=-2)
-        else:
-            raise ValueError(f"Unknown TCAM score mode: {tcam_score_mode}")
-
-        if tcam_attn_mode == "residual":
-            support_attn = F.softmax(support_scores / can_temperature, dim=-1) + 1.0
-            query_attn = F.softmax(query_scores / can_temperature, dim=-1) + 1.0
-        elif tcam_attn_mode == "sigmoid_residual":
-            support_threshold = support_scores.mean(dim=-1, keepdim=True)
-            query_threshold = query_scores.mean(dim=-1, keepdim=True)
-            support_attn = 1.0 + torch.sigmoid(
-                (support_scores - support_threshold) / can_temperature
-            )
-            query_attn = 1.0 + torch.sigmoid(
-                (query_scores - query_threshold) / can_temperature
-            )
-        else:
-            raise ValueError(f"Unknown TCAM attention mode: {tcam_attn_mode}")
+        support_scores = sim.mean(dim=-1)
+        query_scores = sim.mean(dim=-2)
+        support_attn = F.softmax(
+            support_scores / tcam_temperature, dim=-1
+        ) + 1.0
+        query_attn = F.softmax(
+            query_scores / tcam_temperature, dim=-1
+        ) + 1.0
 
         proto_pair = torch.einsum("ntd,nqt->qnd", support_frames, support_attn)
         proto_pair = proto_pair / support_attn.sum(dim=-1).transpose(0, 1).unsqueeze(-1).clamp(min=eps)
@@ -295,11 +252,9 @@ def eval_step_tmclap_no_audio(
         d = F_s_init.shape[-1]
         hidden_dim = max(d // adapter_reduction, 1)
         support_labels = torch.arange(n_way, device=device).repeat_interleave(k_shot)
-        support_index_grid = torch.arange(support_num, device=device).view(n_way, k_shot)
-
         text_memory = torch.nn.Parameter(T_init.clone())
 
-        if adapter_arch == "protoclip":
+        if adapter_arch == "ln":
             adapter_down = torch.nn.Linear(d, hidden_dim, bias=False, device=device)
             adapter_norm_down = torch.nn.LayerNorm(hidden_dim, device=device)
             adapter_up = torch.nn.Linear(hidden_dim, d, bias=False, device=device)
@@ -320,7 +275,7 @@ def eval_step_tmclap_no_audio(
         def _adapter(x):
             if not use_finetune or not use_adapter:
                 return F.normalize(x, p=2, dim=-1)
-            if adapter_arch == "protoclip":
+            if adapter_arch == "ln":
                 z = adapter_norm_down(adapter_down(x))
                 z = adapter_norm_up(adapter_up(z))
             else:
@@ -363,29 +318,11 @@ def eval_step_tmclap_no_audio(
 
                 text_proto = F.normalize(text_memory, p=2, dim=-1)
 
-                if use_rdft_finetune and k_shot > 1:
-                    heldout = torch.randint(0, k_shot, (n_way,), device=device)
-                    class_ids = torch.arange(n_way, device=device)
-                    pseudo_query_idx = support_index_grid[class_ids, heldout]
-
-                    pseudo_support_mask = torch.ones(n_way, k_shot, dtype=torch.bool, device=device)
-                    pseudo_support_mask[class_ids, heldout] = False
-                    pseudo_support_idx = support_index_grid[pseudo_support_mask].view(n_way, k_shot - 1).reshape(-1)
-
-                    pseudo_support_feats = _adapter(F_s_init[pseudo_support_idx])
-                    audio_proto = _support_audio_proto(
-                        pseudo_support_feats,
-                        shots_per_class=k_shot - 1,
-                    )
-                    support_query = _adapter(F_s_init[pseudo_query_idx])
-                    cls_loss = _fused_prob_loss(support_query, audio_proto, text_proto, class_ids)
-                else:
-                    support_query = _adapter(F_s_init)
-                    audio_proto = _support_audio_proto(support_query)
-                    cls_loss = _fused_prob_loss(support_query, audio_proto, text_proto, support_labels)
-
-                align_loss = _alignment_loss(audio_proto, text_proto)
-                loss = cls_loss + lambda_align * align_loss
+                support_query = _adapter(F_s_init)
+                audio_proto = _support_audio_proto(support_query)
+                loss = _fused_prob_loss(
+                    support_query, audio_proto, text_proto, support_labels
+                )
 
                 loss.backward()
                 optimizer.step()

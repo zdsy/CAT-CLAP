@@ -10,7 +10,6 @@ class ZeroShotCLAP(nn.Module):
         self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
         self.sample_rate = sample_rate
         self.frame_features_cache = []
-        self._attribute_embedding_cache = None
 
         use_cuda = self.device.type == "cuda"
         self.model = CLAP(model_id, version=version, use_cuda=use_cuda)
@@ -105,8 +104,7 @@ class ZeroShotCLAP(nn.Module):
         return frames.reshape(bsz, time_steps, -1)
 
     def _speaker_name_from_class_name(self, class_name):
-        class_name = str(class_name).strip()
-        return class_name.replace("_", " ").strip()
+        return str(class_name).strip().replace("_", " ")
 
     def _text_prompts_for_class(self, class_name):
         speaker_name = self._speaker_name_from_class_name(class_name)
@@ -117,139 +115,8 @@ class ZeroShotCLAP(nn.Module):
             f"a person speaking with speaker identity {speaker_name}",
         ]
 
-    def _universal_attribute_prompts(self):
-        """
-        Domain-agnostic acoustic attributes used for support-conditioned text anchors.
-
-        These prompts describe morphology, spectrum, texture, and temporal structure
-        rather than dataset classes such as speakers, birds, or sound events.
-        """
-        return [
-            "a short impulsive sound",
-            "a long sustained sound",
-            "a repeating sound",
-            "a rhythmic sound",
-            "an irregular sound",
-            "a sparse sound with silence between events",
-            "a dense continuous sound texture",
-            "a sound with a sharp attack",
-            "a sound with a gradual onset",
-            "a sound with abrupt changes",
-            "a sound with smooth changes",
-            "a tonal sound",
-            "a harmonic sound",
-            "a noisy sound",
-            "a rough textured sound",
-            "a smooth textured sound",
-            "a bright high frequency sound",
-            "a dark low frequency sound",
-            "a muffled sound",
-            "a clear sound",
-            "a metallic sound",
-            "a percussive sound",
-            "a resonant sound",
-            "a dry non reverberant sound",
-            "a reverberant sound",
-            "a foreground sound with background noise",
-            "a sound with strong background ambience",
-            "a sound with a stable pitch",
-            "a sound with changing pitch",
-            "a sound with a wide frequency range",
-            "a sound with a narrow frequency range",
-            "a low energy sound",
-            "a high energy sound",
-            "a sound with fluctuating energy",
-            "a steady even sound",
-            "a sound made of many small events",
-            "a sound dominated by one salient event",
-            "a natural acoustic sound",
-            "a mechanical acoustic sound",
-            "a human produced acoustic sound",
-        ]
-
     @torch.no_grad()
-    def get_universal_attribute_embeddings(self):
-        if self._attribute_embedding_cache is not None:
-            return self._attribute_embedding_cache.to(self.device)
-
-        prompts = self._universal_attribute_prompts()
-        embeds = self.model.get_text_embeddings(prompts)
-        if not torch.is_tensor(embeds):
-            embeds = torch.as_tensor(embeds)
-        embeds = F.normalize(embeds.to(self.device), p=2, dim=-1)
-        self._attribute_embedding_cache = embeds.detach().cpu()
-        return embeds
-
-    @torch.no_grad()
-    def get_attribute_enhanced_text_anchors(
-        self,
-        class_names,
-        support_audio_features=None,
-        audio_waveforms=None,
-        k_shot=None,
-        attr_weight=1.0,
-        attr_temperature=20.0,
-        top_k=None,
-    ):
-        """
-        Build support-conditioned text anchors from a universal acoustic attribute bank.
-
-        The base class anchor keeps the normal class-name prompts. A class-level
-        support audio prototype retrieves or softly mixes domain-agnostic acoustic
-        attribute prompts in CLAP space, then the retrieved attribute vector is
-        fused back into the text anchor.
-        """
-        base_text = self.get_text_anchors(class_names)
-
-        if support_audio_features is None:
-            if audio_waveforms is None:
-                return base_text
-            support_audio_features = self.get_audio_features(audio_waveforms)
-        elif not torch.is_tensor(support_audio_features):
-            support_audio_features = torch.as_tensor(support_audio_features)
-
-        support_audio_features = F.normalize(
-            support_audio_features.to(self.device).float(), p=2, dim=-1
-        )
-
-        num_classes = len(class_names)
-        if support_audio_features.size(0) == num_classes:
-            support_proto = support_audio_features
-        else:
-            if k_shot is None:
-                if support_audio_features.size(0) % num_classes != 0:
-                    raise ValueError(
-                        "Cannot infer k_shot from support_audio_features. "
-                        "Pass k_shot explicitly."
-                    )
-                k_shot = support_audio_features.size(0) // num_classes
-            support_proto = support_audio_features.view(num_classes, k_shot, -1).mean(dim=1)
-            support_proto = F.normalize(support_proto, p=2, dim=-1)
-
-        attr_bank = self.get_universal_attribute_embeddings()
-        scores = support_proto @ attr_bank.T
-
-        if top_k is not None and 0 < top_k < attr_bank.size(0):
-            top_vals, top_idx = torch.topk(scores, k=top_k, dim=-1)
-            weights = F.softmax(top_vals * attr_temperature, dim=-1)
-            attr_selected = attr_bank[top_idx]
-            attr_proto = torch.einsum("nk,nkd->nd", weights, attr_selected)
-        else:
-            weights = F.softmax(scores * attr_temperature, dim=-1)
-            attr_proto = weights @ attr_bank
-
-        attr_proto = F.normalize(attr_proto, p=2, dim=-1)
-        enhanced = F.normalize(base_text + attr_weight * attr_proto, p=2, dim=-1)
-        return enhanced
-
-    @torch.no_grad()
-    def get_text_anchors(self, class_names, audio_waveforms=None):
-        """Return class-name text anchors.
-
-        The optional audio_waveforms argument is accepted for backward
-        compatibility, but support-conditioned text augmentation now lives in
-        get_attribute_enhanced_text_anchors().
-        """
+    def get_text_anchors(self, class_names):
         text_anchors = []
 
         for class_name in class_names:

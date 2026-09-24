@@ -9,9 +9,6 @@ base:
   out_dim: 128
 models:
 - Hybrid
-clap:
-  finetuned_ckpt: null
-  audio_adapter_ckpt: null
 hyper:
   initial_lr: 0.0005
   min_lr: 0.0001

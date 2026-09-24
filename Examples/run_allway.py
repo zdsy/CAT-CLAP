@@ -52,8 +52,8 @@ def main():
     sys.path.insert(0, str(workdir.parent))
 
     from allway_core import (
-        SelectedRowsDataset, adapt_protoclap, build_support_frame_tensors,
-        build_support_tensors, can_audio_logits_for_batch, get_embeddings,
+        SelectedRowsDataset, adapt_catclap, build_support_frame_tensors,
+        build_support_tensors, tcam_audio_logits_for_batch, get_embeddings,
         make_logits, read_support_manifest, select_validation_rows,
     )
     from cache_baselines import (
@@ -122,12 +122,11 @@ def main():
             model, loader(support_dataset, args.frame_batch_size),
             num_classes, args.shots, device,
         )
-        arch = "tclap" if args.method == "catclap_mlp" else "protoclip"
-        adapter, _, text_proto = adapt_protoclap(
+        arch = "mlp" if args.method == "catclap_mlp" else "ln"
+        adapter, _, text_proto = adapt_catclap(
             support_feats=support_feats, support_labels=support_labels,
             text_init=text_proto, num_classes=num_classes, k_shot=args.shots,
-            ft_steps=30, lr=1e-3, adapter_arch=arch, lambda_align=0.0,
-            learn_audio_memory=False, symmetric_audio_memory=True,
+            ft_steps=30, lr=1e-3, adapter_arch=arch,
             alpha=0.5, beta=5.0, distance="l2", weight_decay=0.05,
         )
     elif args.method == "tip_f":
@@ -201,12 +200,11 @@ def main():
             elif use_tcam:
                 query = adapter(raw)
                 text_logits = make_logits(query, text_proto, distance="l2", beta=5.0)
-                audio_logits = can_audio_logits_for_batch(
+                audio_logits = tcam_audio_logits_for_batch(
                     clap_model=model, query_wavs=query_wavs,
                     support_frame_proto=support_frame_proto, adapter=adapter,
                     device=device, class_chunk_size=args.class_chunk_size,
-                    can_temperature=0.025, tcam_score_mode="mean",
-                    tcam_attn_mode="residual", beta=5.0, distance="l2",
+                    tcam_temperature=0.025, beta=5.0, distance="l2",
                 )
                 probs = 0.5 * F.softmax(audio_logits, dim=1) + 0.5 * F.softmax(text_logits, dim=1)
                 preds = probs.argmax(dim=1)
